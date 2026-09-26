@@ -1,0 +1,15 @@
+# build artifacts
+harness/bin/
+solution/cpp/bin/
+solution/rust/target/
+
+# generated data and derived caches (large / reproducible)
+data/
+harness/.cache/
+
+# python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

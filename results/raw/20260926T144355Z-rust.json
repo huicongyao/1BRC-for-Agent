@@ -1,0 +1,26 @@
+{
+  "ts": "2026-09-26T14:41:21Z",
+  "track": "rust",
+  "status": "valid",
+  "reason": null,
+  "input": "data/measurements_1b.txt",
+  "input_bytes": 13795509404,
+  "expected_sha256": "fa0299de6a1fefeb5c50a822a9b694761ee1d0a3d5180b8e5a8bb9554a4be0f6",
+  "runs": 1,
+  "warmup": 0,
+  "times": [
+    76.6164
+  ],
+  "median": 76.61636437498964,
+  "min": 76.61636437498964,
+  "max": 76.61636437498964,
+  "max_rss_bytes": 2965504,
+  "commit": "no-git",
+  "dirty": false,
+  "fresh": {
+    "rows": 1000000,
+    "seed": 2899218270716890369,
+    "ok": true,
+    "detail": "match"
+  }
+}
