@@ -81,6 +81,7 @@ Evidence (probe programs, full 13.8 GB file, same machine state):
 | 4 streams, 4 MB, shared fd                           | ~6.2 s |
 | 4 streams, 16 MB, per-fd + F_NOCACHE                 | ~5.3-6.6 s |
 | 3 | 2026-09-27 | parser pool 6 -> 10 threads, block pool 8 -> 12 | 5.668 | -3.5% | 0.196 | accepted | see log |
+| | | **plateau: #4, #5, #6 each < 1% -> frozen** | | | | | |
 
 So both the file offset *and* the destination buffer must be 4096-byte aligned
 for the uncached DMA path; otherwise the kernel falls back to a ~40% slower
@@ -120,7 +121,51 @@ Interleaved sweep on the full file, 5 rounds each, medians:
 | parsers | 4 | 6 | 8 | 10 | 12 |
 |---|---|---|---|---|---|
 | median (s) | 6.52 | 5.91 | 5.68 | **5.60** | 5.63 |
+| 4 | 2026-09-27 | pool/block size sweep (12x16, 16x16, 8x16, 12x32, 12x64) | 5.61-5.88, no winner | <1% | 0.131-0.262 | rejected (kept 12x16MB) | - |
+| 5 | 2026-09-27 | CPU on critical path? parse=8 GB/s vs device 2.3-3.4 GB/s, overhead <10 ms | no change | <1% | - | rejected (no change possible) | - |
+| 6 | 2026-09-27 | 12 -> 16 block slots | 5.76 vs 5.74 | <1% | - | rejected, reverted | - |
 
 Block size at 10 parsers: 8 MB 5.75, 16 MB 5.64, 32 MB 5.61 - 16 MB kept
 (same speed, half the buffer memory).  Official bench after the change:
 5.668 s median, peak RSS 196 MB.
+
+### #4-#6 plateau experiments (all < 1%, nothing accepted)
+
+| # | hypothesis | measurement | decision |
+|---|---|---|---|
+| 4 | deeper pool / larger blocks help (fewer reader stalls, less per-block overhead) | interleaved 4 rounds at 10 parsers: 12x16MB 5.74, 16x16MB 5.78, 8x16MB 5.88, 12x64MB 5.73, 12x32MB 5.61 - all within noise | keep 12x16MB |
+| 5 | CPU work is on the critical path | parse-only on a cached 138 MB file: 0.04 s wall / 0.17 s CPU => ~8 GB/s parse capacity with the pool, vs ~2.3-3.4 GB/s device; fixed overhead (1-line input) < 10 ms | no code change can help |
+| 6 | 12 -> 16 block slots | interleaved 4 rounds: 5.76 vs 5.74 median (< 0.5%) | rejected, reverted |
+
+Also measured and rejected along the way: POSIX `aio_read` (depth 4 fails with
+EAGAIN, depth 1 is slower than plain `pread`), `F_RDADVISE` read-ahead
+(5.39 s vs 5.28 s), `mmap` + `MADV_SEQUENTIAL` (0.59 GB/s), per-thread slice
+readers with F_NOCACHE (2.6 GB/s peak), 8/32/64 MB blocks, 4/6/8/12 parser
+threads.
+
+### Retrospective
+
+What worked, in order of impact:
+
+1. **Find out what the machine actually does before writing code.** Probing
+   showed the workload is a sequential SSD read of 13.8 GB that never fits in
+   the page cache, so the whole problem is "keep the device busy and stay out
+   of the way". That single measurement ruled out two days of would-be work on
+   parser micro-optimisation (the parser has 2.4-4x headroom at all times).
+2. **`read(2)` + `F_NOCACHE` with 4096-aligned offsets and buffers**: 2.25 ->
+   3.2-3.5 GB/s, the largest single win after going parallel.
+3. **Parallel aggregation** (SWAR line parser, 64-byte open-addressing slots,
+   integer tenths): removed the ~80 s of scalar work the naive version spent.
+4. **Exact-rational mean with a rare sequential-`double` fallback**, so that
+   parallel summation is byte-exact against the reference even at rounding
+   boundaries (verified with a constructed tie where exact arithmetic alone
+   gives 1.5 and the reference prints 1.4).
+
+What did not work: `mmap` (4x slower than `read` on this machine), any form of
+extra I/O concurrency (2/4/8 streams, AIO), read-ahead hints, and every CPU-side
+tweak tried after the parser was already 3x faster than needed.
+
+Remaining known headroom: ~2-4% - the pipeline adds a ~0.1-0.3 s tail
+(the last blocks drain while the device is idle) and the reader is otherwise
+within 0-4% of a pure `read()` of the same file measured in the same minute.
+The score also moves ~1-3% run to run with ambient load on this shared machine.

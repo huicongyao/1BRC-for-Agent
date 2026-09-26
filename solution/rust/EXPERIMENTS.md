@@ -10,6 +10,7 @@ and measurements that looked like noise). `median` is the score from
 | 1 | 2026-09-27 | read_at-based parallel readers + SWAR parser + per-thread hash tables + exact integer aggregation | 6.156 | -92.0% | 0.035 | accepted | see log |
 | 2 | 2026-09-27 | same aligned-reader pipeline via std read_at + extern fcntl(F_NOCACHE) | 6.143 | -0.2% vs #1 bench, -17% interleaved A/B | 0.131 | accepted | see log |
 | 3 | 2026-09-27 | parser pool 6 -> 10 threads, block pool 8 -> 12 | 5.624 | -8.4% vs #2 bench, -3% interleaved A/B | 0.196 | accepted | see log |
+| | | **plateau: #4, #5, #6 each < 1% -> frozen** | | | | | |
 
 ## Notes
 
@@ -69,9 +70,37 @@ Same experiment as the C++ track.  Interleaved sweep, 5 rounds each, medians:
 | parsers | 6 | 8 | 10 | 12 |
 |---|---|---|---|---|
 | median (s) | 5.70 | 5.54 | **5.53** | 5.53 |
+| 4 | 2026-09-27 | pool/block size sweeps | 5.73-5.85, no winner | <1% | 0.131-0.262 | rejected (kept 12x16MB) | - |
+| 5 | 2026-09-27 | CPU on critical path? parse=9 GB/s vs device 2.3-3.4 GB/s, overhead <10 ms | no change | <1% | - | rejected (no change possible) | - |
+| 6 | 2026-09-27 | 12 -> 16 block slots | 5.86 vs 5.91 | <1% | - | rejected, reverted | - |
 
 10 parsers and 12 block slots kept (matching the C++ track).  Official bench
 after the change: 5.624 s median, peak RSS 196 MB.  Extra parsers are cheap
 because they spend most of their time waiting on the queue - the reader is the
 bottleneck - but they drain the pool faster, which shortens the reader's
 `acquire()` stalls.
+
+### #4-#6 plateau experiments (all < 1%, nothing accepted)
+
+| # | hypothesis | measurement | decision |
+|---|---|---|---|
+| 4 | pool/block sizing helps | interleaved sweeps: 8 slots 5.85, 12 slots 5.74, 16 slots 5.78, 64 MB blocks 5.73 medians | keep 12x16MB |
+| 5 | CPU work is on the critical path | parse-only on a cached 138 MB file: 0.03 s wall / 0.15 s CPU => ~9 GB/s parse capacity vs 2.3-3.4 GB/s device; fixed overhead < 10 ms | no code change can help |
+| 6 | 12 -> 16 block slots | interleaved 4 rounds: 5.86 vs 5.91 median | rejected, reverted |
+
+### Retrospective
+
+Same conclusion as the C++ track, reached with the same probes: the run is a
+sequential SSD read, so the only wins that matter are I/O wins.
+
+* The Rust port is a line-by-line mirror of the C++ design (aligned
+  `F_NOCACHE` reader on the main thread, parser pool over a bounded queue,
+  SWAR parser, 64-byte slots, exact-rational mean with sequential fallback).
+* Rust needs one thing std does not wrap - `fcntl(F_NOCACHE)` - so that call is
+  a direct `extern "C"` binding; everything else (reads, threads, aligned
+  allocation, sorting) is std. The build stays offline and crate-free.
+* Peak RSS is 196 MB, essentially the 12 x 16 MB block pool.
+
+Remaining known headroom: ~2-4%, identical to the C++ track (pipeline tail
+drain plus run-to-run ambient load). Both tracks measure within 0-4% of a raw
+`read()` of the same 13.8 GB file taken in the same minute.
