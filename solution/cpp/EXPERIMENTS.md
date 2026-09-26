@@ -80,6 +80,7 @@ Evidence (probe programs, full 13.8 GB file, same machine state):
 | 1 stream, 16 MB, F_NOCACHE, file offset 512 (not 4k) | 6.77 s (2.04 GB/s) |
 | 4 streams, 4 MB, shared fd                           | ~6.2 s |
 | 4 streams, 16 MB, per-fd + F_NOCACHE                 | ~5.3-6.6 s |
+| 3 | 2026-09-27 | parser pool 6 -> 10 threads, block pool 8 -> 12 | 5.668 | -3.5% | 0.196 | accepted | see log |
 
 So both the file offset *and* the destination buffer must be 4096-byte aligned
 for the uncached DMA path; otherwise the kernel falls back to a ~40% slower
@@ -107,3 +108,19 @@ same file measured in the same minute, so the remaining time is the device.
 Also measured during this experiment: the single reader reaches the same
 throughput with 0, 4 or 6 CPU-heavy competitor threads (2.72 -> 2.65 GB/s), so
 the parser pool does not starve it.
+
+### #3 parser pool sizing (accepted)
+
+Hypothesis: the reader blocks on the pool whenever all slots are busy, so more
+consumers shorten those stalls; the parsers are otherwise idle (the reader is
+the bottleneck), so oversubscribing costs nothing.
+
+Interleaved sweep on the full file, 5 rounds each, medians:
+
+| parsers | 4 | 6 | 8 | 10 | 12 |
+|---|---|---|---|---|---|
+| median (s) | 6.52 | 5.91 | 5.68 | **5.60** | 5.63 |
+
+Block size at 10 parsers: 8 MB 5.75, 16 MB 5.64, 32 MB 5.61 - 16 MB kept
+(same speed, half the buffer memory).  Official bench after the change:
+5.668 s median, peak RSS 196 MB.

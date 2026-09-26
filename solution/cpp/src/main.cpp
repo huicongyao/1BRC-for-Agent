@@ -62,8 +62,8 @@
 namespace {
 
 // ---------------------------------------------------------------- tuning ----
-constexpr int      kParsers = 6;          // worker threads
-constexpr int      kSlots   = 8;          // buffer pool (kParsers + lookahead)
+constexpr int      kParsers = 10;         // worker threads
+constexpr int      kSlots   = 12;         // buffer pool (kParsers + lookahead)
 constexpr size_t   kBlock   = 16u << 20;  // streamed read block
 constexpr size_t   kCarry   = 4096;       // max partial line carried between blocks
 constexpr size_t   kAlign   = 4096;       // F_NOCACHE DMA alignment
