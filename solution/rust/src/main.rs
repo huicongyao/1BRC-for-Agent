@@ -41,8 +41,8 @@ use std::sync::{Condvar, Mutex};
 use std::thread;
 
 // ---------------------------------------------------------------- tuning ----
-const KPARSERS: usize = 6; // worker threads
-const KSLOTS: usize = 8; // buffer pool (KPARSERS + lookahead)
+const KPARSERS: usize = 10; // worker threads
+const KSLOTS: usize = 12; // buffer pool (KPARSERS + lookahead)
 const KBLOCK: usize = 16 << 20; // streamed read block
 const KCARRY: usize = 4096; // max partial line carried between blocks
 const KALIGN: usize = 4096; // F_NOCACHE DMA alignment

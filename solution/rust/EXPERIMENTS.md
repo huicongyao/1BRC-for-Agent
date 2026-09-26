@@ -9,6 +9,7 @@ and measurements that looked like noise). `median` is the score from
 | 0 | 2026-09-26 | naive baseline (BufReader + BTreeMap + manual parse), 1-run record | 76.616 | - | 0.003 | starting point | - |
 | 1 | 2026-09-27 | read_at-based parallel readers + SWAR parser + per-thread hash tables + exact integer aggregation | 6.156 | -92.0% | 0.035 | accepted | see log |
 | 2 | 2026-09-27 | same aligned-reader pipeline via std read_at + extern fcntl(F_NOCACHE) | 6.143 | -0.2% vs #1 bench, -17% interleaved A/B | 0.131 | accepted | see log |
+| 3 | 2026-09-27 | parser pool 6 -> 10 threads, block pool 8 -> 12 | 5.624 | -8.4% vs #2 bench, -3% interleaved A/B | 0.196 | accepted | see log |
 
 ## Notes
 
@@ -60,3 +61,17 @@ in a busier window (raw device 2.30 GB/s then, vs 3.3 GB/s during the quiet
 window that produced the C++ 5.875 s record).  Ambient load on this shared
 machine moves the device between ~2.3 and ~3.4 GB/s, so cross-track comparisons
 must be made from interleaved runs, not from records taken minutes apart.
+
+### #3 parser pool sizing (accepted)
+
+Same experiment as the C++ track.  Interleaved sweep, 5 rounds each, medians:
+
+| parsers | 6 | 8 | 10 | 12 |
+|---|---|---|---|---|
+| median (s) | 5.70 | 5.54 | **5.53** | 5.53 |
+
+10 parsers and 12 block slots kept (matching the C++ track).  Official bench
+after the change: 5.624 s median, peak RSS 196 MB.  Extra parsers are cheap
+because they spend most of their time waiting on the queue - the reader is the
+bottleneck - but they drain the pool faster, which shortens the reader's
+`acquire()` stalls.

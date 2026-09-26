@@ -9,12 +9,13 @@ Machine: Apple M4 (10 cores, 16 GB RAM), macOS. Score = median wall time over ru
 | track | median (s) | min (s) | max (s) | peak RSS | commit | date (UTC) |
 |---|---|---|---|---|---|---|
 | cpp | 5.668 | 5.647 | 5.732 | 195.8 MB | `8aca780`* | 2026-09-26T17:51:08Z |
-| rust | 6.143 | 6.102 | 6.227 | 130.9 MB | `c700d33`* | 2026-09-26T17:41:02Z |
+| rust | 5.624 | 5.577 | 5.661 | 195.6 MB | `ad44a11`* | 2026-09-26T17:54:27Z |
 
 ## All runs
 
 | date (UTC) | track | status | median (s) | min (s) | max (s) | runs | peak RSS | commit | note |
 |---|---|---|---|---|---|---|---|---|---|
+| 2026-09-26T17:54:27Z | rust | valid | 5.624 | 5.577 | 5.661 | 5 | 195.6 MB | `ad44a11`* | fresh:pass seed=2919163291255929310 |
 | 2026-09-26T17:51:08Z | cpp | valid | 5.668 | 5.647 | 5.732 | 5 | 195.8 MB | `8aca780`* | fresh:pass seed=4181125432636780333 |
 | 2026-09-26T17:41:02Z | rust | valid | 6.143 | 6.102 | 6.227 | 5 | 130.9 MB | `c700d33`* | fresh:pass seed=7655559461075258408 |
 | 2026-09-26T17:37:38Z | cpp | valid | 5.875 | 5.871 | 5.919 | 5 | 130.9 MB | `c700d33`* | fresh:pass seed=5858710510146929415 |
