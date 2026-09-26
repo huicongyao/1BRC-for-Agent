@@ -8,6 +8,7 @@ and measurements that looked like noise). `median` is the score from
 |---|---|---|---|---|---|---|---|
 | 0 | 2026-09-26 | naive baseline (BufReader + BTreeMap + manual parse), 1-run record | 76.616 | - | 0.003 | starting point | - |
 | 1 | 2026-09-27 | read_at-based parallel readers + SWAR parser + per-thread hash tables + exact integer aggregation | 6.156 | -92.0% | 0.035 | accepted | see log |
+| 2 | 2026-09-27 | same aligned-reader pipeline via std read_at + extern fcntl(F_NOCACHE) | 6.143 | -0.2% vs #1 bench, -17% interleaved A/B | 0.131 | accepted | see log |
 
 ## Notes
 
@@ -38,3 +39,24 @@ Bugs found and fixed while porting (recorded because they are easy to repeat):
 * Stale bytes past the carry must never be re-parsed: the previous C++ tail
   path appended a synthetic newline and then parsed past it, picking up
   fragments of the previous buffer content.
+
+### #2 single sequential F_NOCACHE reader (accepted)
+
+Same change as the C++ track, in Rust: one reader thread streaming 16 MB
+4096-aligned blocks with `F_NOCACHE`, 6 parser threads over a bounded
+block queue, and the partial line parked in front of the aligned read area.
+
+* Buffers come from `std::alloc::alloc` with `Layout::from_size_align(.., 4096)`
+  (no crate, no libc malloc wrapper).
+* `F_NOCACHE` is the one thing std does not wrap, so it is a direct
+  `extern "C" { fn fcntl(..) }` declaration against the C library that std
+  already links; no crate is involved and the build stays `--offline`.
+* Reader and parsers use the same `File` through `FileExt::read_at`.
+
+Result: interleaved A/B against the #1 binary, same ambient conditions,
+3 rounds each - #1: 6.15 / 6.31 / 6.41 s (median 6.31), #2: 5.18 / 5.26 /
+5.29 s (median 5.26), i.e. **-17%**; the official bench recorded 6.143 s median
+in a busier window (raw device 2.30 GB/s then, vs 3.3 GB/s during the quiet
+window that produced the C++ 5.875 s record).  Ambient load on this shared
+machine moves the device between ~2.3 and ~3.4 GB/s, so cross-track comparisons
+must be made from interleaved runs, not from records taken minutes apart.

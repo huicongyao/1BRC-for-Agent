@@ -5,19 +5,28 @@
  *
  * Design notes
  * ------------
- * - The 1B input does not fit in the page cache, so wall clock is dominated by
- *   reading ~13.8 GB from the SSD.  On this machine read(2) into a large buffer
- *   sustains ~2.3 GB/s while mmap page-faulting sustains only ~0.6 GB/s, and
- *   extra concurrent streams do not raise device throughput.  So: a few threads,
- *   each pread()ing its own contiguous, newline-aligned slice in kBlock chunks
- *   and parsing in place, overlapping parse work with I/O.
- * - Parsing uses 8-byte SWAR loads: locate ';', then decode the canonical
- *   temperature forms [-]D.D / [-]DD.D / [-]DDD.D with a single 8-byte load.
- *   Anything else falls back to a tolerant scalar parser that mirrors the
- *   reference implementation.
- * - Aggregation keeps per-thread open-addressing tables (64-byte slots, one
- *   cache line each) keyed by a hash of the station name.  min/max/sum are
- *   accumulated as exact integers of scaled tenths.
+ * The 1B input does not fit in the page cache, so wall clock is dominated by
+ * reading ~13.8 GB from the SSD.  Measurements on this machine:
+ *
+ *   read(2), 1 stream, F_NOCACHE, 4096-aligned offset+buffer  ~3.2-3.5 GB/s
+ *   read(2), 1 stream, F_NOCACHE, misaligned                   ~2.0 GB/s
+ *   read(2), 1 stream, buffered (page cache)                   ~2.25 GB/s
+ *   mmap + page faults                                         ~0.59 GB/s
+ *   2/4/8 parallel streams                                     no gain, often worse
+ *
+ * So the fast path is: *one* reader thread streaming the file sequentially in
+ * large page-aligned blocks with F_NOCACHE (no cache pollution, no double
+ * buffering), and kParsers worker threads parsing those blocks in parallel.
+ * The reader splits each block at the last line boundary so parsers only ever
+ * see whole lines; the partial line is parked in the kCarryArea bytes in front
+ * of the aligned read area, which keeps the parser input contiguous without
+ * ever misaligning the F_NOCACHE destination.
+ *
+ * Parsing uses 8-byte SWAR loads: locate ';' with a haszero trick, then decode
+ * the canonical temperature forms [-]D.D / [-]DD.D / [-]DDD.D from a single
+ * 8-byte load.  Anything else falls back to a tolerant scalar parser that
+ * mirrors harness/src/reference.c.  Aggregation keeps per-thread
+ * open-addressing tables (64-byte slots) of exact integer tenths.
  *
  * Mean rounding
  * -------------
@@ -28,21 +37,23 @@
  * The two agree unless the exact value lands inside the reference's rounding
  * error of a .5 boundary; that window is bounded by
  *     |dQ| <= 8 * u * (n * max|t10| + 8 * (|S|/n + 1)),   u = 2^-53
- * (per-add error bound + per-value conversion rounding + final operations).
- * Every station whose exact value falls inside that window is recomputed with
- * a sequential double scan in file order, exactly like the reference.  For the
- * harness inputs the window is ~1e-6 wide, so it triggers with probability
- * ~1e-3 and never costs measurable time.
+ * (per-add bound + per-value conversion + final ops).  Every station inside it
+ * is recomputed with a sequential double scan in file order, exactly like the
+ * reference, so the output stays byte-identical.  For the harness inputs the
+ * window is ~1e-6 wide, so it triggers with probability ~1e-3.
  */
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fcntl.h>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -51,11 +62,16 @@
 namespace {
 
 // ---------------------------------------------------------------- tuning ----
-constexpr int      kThreads = 4;         // reader+parser threads
-constexpr size_t   kBlock   = 4u << 20;  // read block per thread
-constexpr size_t   kSlack   = 4096;      // buffer tail slack for 8-byte over-reads
-constexpr uint32_t kMaxLine = 96;        // fast path assumption: every line is shorter
-constexpr uint32_t kMaxName = 32;        // slot name capacity
+constexpr int      kParsers = 6;          // worker threads
+constexpr int      kSlots   = 8;          // buffer pool (kParsers + lookahead)
+constexpr size_t   kBlock   = 16u << 20;  // streamed read block
+constexpr size_t   kCarry   = 4096;       // max partial line carried between blocks
+constexpr size_t   kAlign   = 4096;       // F_NOCACHE DMA alignment
+constexpr size_t   kCarryArea = 8192;     // space reserved in front of the read area
+constexpr size_t   kSlack   = 4096;       // buffer tail slack for 8-byte over-reads
+constexpr uint32_t kMaxLine = 96;         // fast path assumption: every line is shorter
+constexpr uint32_t kMaxName = 32;         // slot name capacity
+constexpr size_t   kNoCacheMin = 256u << 20;  // bypass the cache for big inputs
 
 constexpr uint64_t kSemi = 0x3B3B3B3B3B3B3B3BULL;  // ';' x8
 constexpr uint64_t kOnes = 0x0101010101010101ULL;
@@ -340,8 +356,182 @@ bool pread_full(int fd, void *buf, size_t n, size_t off, size_t *got) {
     return true;
 }
 
+struct WorkerSink {
+    Table *table;
+    LongNameTable *longs;
+    inline void add(const uint8_t *name, uint32_t len, uint64_t h, int32_t t10) {
+        if (len <= kMaxName) {
+            table->add(name, len, h, t10);
+        } else {
+            longs->add(name, len, h, t10);
+        }
+    }
+};
+
+// Buffer handed from the reader to the parsers.
+struct Block {
+    uint8_t *raw = nullptr;         // page-aligned allocation
+    size_t   cap = 0;
+    const uint8_t *data = nullptr;  // parser input (carry + fresh bytes)
+    size_t   len = 0;
+    bool     last = false;
+    ~Block() { std::free(raw); }
+    void reserve(size_t need) {
+        if (cap >= need) return;
+        size_t rounded = (need + kAlign - 1) & ~(kAlign - 1);
+        void *p = nullptr;
+        if (posix_memalign(&p, kAlign, rounded) != 0) {
+            std::fprintf(stderr, "out of memory\n");
+            std::exit(1);
+        }
+        std::free(raw);
+        raw = (uint8_t *)p;
+        cap = rounded;
+    }
+};
+
+// Bounded hand-off queue with a buffer pool.
+class BlockQueue {
+  public:
+    BlockQueue() {
+        for (int i = 0; i < kSlots; i++) {
+            Block *b = new Block();
+            b->reserve(kCarryArea + kBlock + kSlack);
+            free_.push_back(b);
+        }
+    }
+    ~BlockQueue() {
+        for (Block *b : free_) delete b;
+        for (Block *b : ready_) delete b;
+    }
+    Block *acquire() {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_free_.wait(lk, [this] { return !free_.empty(); });
+        Block *b = free_.back();
+        free_.pop_back();
+        return b;
+    }
+    void publish(Block *b) {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            ready_.push_back(b);
+        }
+        cv_ready_.notify_one();
+    }
+    Block *take() {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_ready_.wait(lk, [this] { return !ready_.empty() || done_; });
+        if (ready_.empty()) return nullptr;
+        Block *b = ready_.front();
+        ready_.pop_front();
+        return b;
+    }
+    void release(Block *b) {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            free_.push_back(b);
+        }
+        cv_free_.notify_one();
+    }
+    void finish() {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            done_ = true;
+        }
+        cv_ready_.notify_all();
+    }
+
+  private:
+    std::mutex m_;
+    std::condition_variable cv_free_, cv_ready_;
+    std::deque<Block *> free_, ready_;
+    bool done_ = false;
+};
+
+// Index just past the last '\n' in [buf, buf+n), or 0 if there is none within
+// the last kCarry bytes (then the reader accumulates that line separately).
+inline size_t last_line_end(const uint8_t *buf, size_t n) {
+    size_t lo = n > kCarry ? n - kCarry : 0;
+    size_t i = n;
+    while (i > lo) {
+        if (buf[i - 1] == '\n') return i;
+        i--;
+    }
+    return 0;
+}
+
+// The single sequential reader: F_NOCACHE, large page-aligned blocks.
+void reader(int fd, size_t fsize, BlockQueue &q, WorkerSink &giant) {
+    std::vector<uint8_t> longline;  // only for lines longer than kCarry
+    size_t pos = 0;
+    size_t carry = 0;
+    Block *cur = q.acquire();
+    for (;;) {
+        size_t want = fsize - pos;
+        if (want > kBlock) want = kBlock;
+        uint8_t *rdst = cur->raw + kCarryArea;  // page aligned
+        size_t got = 0;
+        pread_full(fd, rdst, want, pos, &got);
+        pos += got;
+        bool at_end = (got == 0) || (pos >= fsize);
+
+        if (!longline.empty()) {
+            // A line longer than kCarry is being accumulated.
+            longline.insert(longline.end(), rdst, rdst + got);
+            const size_t extra = 64;
+            longline.resize(longline.size() + extra, 0);
+            const uint8_t *stop =
+                parse_lines(longline.data(), longline.size() - extra, giant);
+            size_t consumed = (size_t)(stop - longline.data());
+            longline.resize(longline.size() - extra);
+            if (consumed) longline.erase(longline.begin(), longline.begin() + (ptrdiff_t)consumed);
+            if (at_end) {
+                if (!longline.empty()) {
+                    parse_one(longline.data(),
+                              strip_eol(longline.data(), longline.data() + longline.size()),
+                              giant);
+                }
+                break;
+            }
+            continue;
+        }
+
+        uint8_t *data = rdst - carry;  // carry area + fresh bytes
+        size_t n = carry + got;
+        size_t cut = at_end ? n : last_line_end(data, n);
+        if (!at_end && cut == 0) {
+            longline.assign(data, data + n);
+            carry = 0;
+            continue;
+        }
+        cur->data = data;
+        cur->len = cut;
+        cur->last = at_end;
+        q.publish(cur);
+        if (at_end) break;
+        carry = n - cut;
+        cur = q.acquire();
+        if (carry) std::memcpy(cur->raw + kCarryArea - carry, data + cut, carry);
+    }
+}
+
+void parser(BlockQueue &q, Table &table, LongNameTable &longs) {
+    WorkerSink sink{&table, &longs};
+    for (;;) {
+        Block *b = q.take();
+        if (!b) break;
+        if (b->len) {
+            const uint8_t *stop = parse_lines(b->data, b->len, sink);
+            if (stop < b->data + b->len) {
+                parse_one(stop, strip_eol(stop, b->data + b->len), sink);
+            }
+        }
+        q.release(b);
+    }
+}
+
 // Streams [start, end) in kBlock chunks, feeding every complete line to sink.
-// `end` is a line boundary or the end of file.
+// Used off the hot path (the ambiguous-mean rescan) and for small inputs.
 template <typename Sink>
 void stream_range(int fd, size_t start, size_t end, Sink &sink) {
     std::vector<uint8_t> buf(kBlock + kSlack);
@@ -362,10 +552,8 @@ void stream_range(int fd, size_t start, size_t end, Sink &sink) {
         if (carry) std::memmove(buf.data(), p, carry);
     }
     if (carry) {
-        // All remaining bytes are complete lines except possibly the last one.
         const uint8_t *p = parse_lines(buf.data(), carry, sink);
         if (p < buf.data() + carry) {
-            // Final line without a trailing newline (tolerated by the reference).
             parse_one(p, strip_eol(p, buf.data() + carry), sink);
         }
     }
@@ -431,68 +619,36 @@ int main(int argc, char **argv) {
         return 1;
     }
     size_t fsize = (size_t)fsize_off;
-#ifdef POSIX_FADV_SEQUENTIAL
-    posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#ifdef F_NOCACHE
+    // Large inputs are read once, so keeping them out of the buffer cache both
+    // avoids double buffering and avoids evicting everything else; small
+    // inputs may still be cached from the generator, where normal reads win.
+    if (fsize >= kNoCacheMin) fcntl(fd, F_NOCACHE, 1);
 #endif
 
-    // Split the file into newline-aligned slices.
-    int nthreads = kThreads;
-    if (fsize < kBlock) nthreads = 1;
-    std::vector<size_t> bounds((size_t)nthreads + 1);
-    bounds[0] = 0;
-    bounds[(size_t)nthreads] = fsize;
-    for (int i = 1; i < nthreads; i++) {
-        size_t b = fsize / (size_t)nthreads * (size_t)i;
-        uint8_t tmp[256];
-        size_t probe = b;
-        size_t nlpos = fsize;
-        while (probe < fsize) {
-            size_t got = 0;
-            if (!pread_full(fd, tmp, sizeof(tmp), probe, &got) || got == 0) break;
-            const uint8_t *nl = (const uint8_t *)std::memchr(tmp, '\n', got);
-            if (nl) {
-                nlpos = probe + (size_t)(nl - tmp) + 1;
-                break;
-            }
-            probe += got;
-        }
-        bounds[(size_t)i] = nlpos;
-    }
-    for (int i = 1; i < nthreads; i++) {
-        if (bounds[(size_t)i] < bounds[(size_t)i - 1]) bounds[(size_t)i] = bounds[(size_t)i - 1];
-    }
-
-    std::vector<Table> tables((size_t)nthreads);
-    std::vector<LongNameTable> longs((size_t)nthreads);
+    std::vector<Table> tables((size_t)kParsers + 1);
+    std::vector<LongNameTable> longs((size_t)kParsers + 1);
+    BlockQueue queue;
     std::vector<std::thread> threads;
-    threads.reserve((size_t)nthreads);
-    for (int i = 0; i < nthreads; i++) {
-        threads.emplace_back([&, i]() {
-            Table &tab = tables[(size_t)i];
-            tab.init();
-            size_t start = bounds[(size_t)i];
-            size_t end = bounds[(size_t)i + 1];
-            if (start >= end) return;
-            struct Sink {
-                Table *tab;
-                LongNameTable *longs;
-                inline void add(const uint8_t *name, uint32_t len, uint64_t h, int32_t t10) {
-                    if (len <= kMaxName) {
-                        tab->add(name, len, h, t10);
-                    } else {
-                        longs->add(name, len, h, t10);
-                    }
-                }
-            } sink{&tab, &longs[(size_t)i]};
-            stream_range(fd, start, end, sink);
-        });
+    threads.reserve((size_t)kParsers + 1);
+    for (int i = 0; i < kParsers; i++) {
+        tables[(size_t)i].init();
+        threads.emplace_back(parser, std::ref(queue), std::ref(tables[(size_t)i]),
+                             std::ref(longs[(size_t)i]));
     }
+    // The reader runs on the main thread so no scheduling handshake is needed
+    // before it starts streaming.  Its own tables only ever see lines longer
+    // than kCarry (never produced by the generator).
+    tables[(size_t)kParsers].init();
+    WorkerSink giant{&tables[(size_t)kParsers], &longs[(size_t)kParsers]};
+    reader(fd, fsize, queue, giant);
+    queue.finish();
     for (std::thread &t : threads) t.join();
 
     // Merge per-thread tables.
     std::vector<Rec> recs;
     recs.reserve(1024);
-    for (int i = 0; i < nthreads; i++) {
+    for (int i = 0; i <= kParsers; i++) {
         for (const Slot &s : tables[(size_t)i].slots()) {
             if (!s.cnt) continue;
             Rec r;

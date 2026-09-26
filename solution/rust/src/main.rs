@@ -2,37 +2,54 @@
 //
 //   onebrc <input_file>   -> result to stdout
 //
-// Design notes (details and measurements in EXPERIMENTS.md)
-// ---------------------------------------------------------
+// Design notes (measurements in EXPERIMENTS.md)
+// --------------------------------------------
 // The 1B input does not fit in the page cache, so wall clock is dominated by
-// reading ~13.8 GB from the SSD (~2.3 GB/s on this machine, and concurrent
-// streams do not raise it).  kThreads threads each pread() their own
-// contiguous, newline-aligned slice in kBlock chunks and parse the block in
-// place, overlapping parsing with I/O.  std only: FileExt::read_at for the
-// slice reads, std::thread::scope for the workers.
+// reading ~13.8 GB from the SSD:
 //
-// Parsing uses 8-byte SWAR loads (locate ';' with a haszero trick, decode the
-// canonical temperature forms from one 8-byte load); anything unusual falls
-// back to a scalar parser that mirrors harness/src/reference.c exactly.
-// Aggregation uses per-thread open-addressing tables of 64-byte slots.
+//   read(2), 1 stream, F_NOCACHE, 4096-aligned offset+buffer  ~3.2-3.5 GB/s
+//   read(2), 1 stream, F_NOCACHE, misaligned                   ~2.0 GB/s
+//   read(2), 1 stream, buffered (page cache)                   ~2.25 GB/s
+//   2/4/8 parallel streams                                     no gain, often worse
 //
-// Mean rounding: the reference accumulates `sum` as a double in file order, so
-// this implementation computes the exact rational mean instead and flags any
-// station whose exact value falls inside the reference's rounding error of a
-// .5 boundary; those are recomputed with a sequential double scan in file
-// order, exactly like the reference.  See the C++ track notes for the bound.
+// So: *one* reader thread streams the file sequentially in large page-aligned
+// blocks with F_NOCACHE, and KPARSERS worker threads parse those blocks in
+// parallel.  The reader splits every block at its last line boundary, so
+// parsers only see whole lines; the partial line is parked in KCARRY_AREA
+// bytes in front of the aligned read area, keeping parser input contiguous
+// without ever misaligning the read destination.
+//
+// std only: FileExt::read_at for the reads, std::thread::scope for the
+// workers, std::alloc for the 4096-byte-aligned buffers.  The single F_NOCACHE
+// fcntl is declared as a direct extern "C" binding to the C library that std
+// already links (std has no fcntl wrapper, and the flag is worth ~15-30% of
+// the whole run); no crate is involved.
+//
+// Parsing uses 8-byte SWAR loads and a tolerant scalar fallback that mirrors
+// harness/src/reference.c.  Mean rounding: the reference accumulates `sum` as
+// a double in file order, which parallel accumulation cannot reproduce, so the
+// exact rational mean is used instead and every station landing inside the
+// reference's rounding error of a .5 boundary is recomputed with a sequential
+// double scan in file order (see the C++ track notes for the bound).
 
+use std::alloc::{alloc, dealloc, Layout};
 use std::fs::File;
 use std::io::ErrorKind;
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
+use std::sync::{Condvar, Mutex};
 use std::thread;
 
 // ---------------------------------------------------------------- tuning ----
-const KTHREADS: usize = 4; // reader+parser threads
-const KBLOCK: usize = 4 << 20; // read block per thread
+const KPARSERS: usize = 6; // worker threads
+const KSLOTS: usize = 8; // buffer pool (KPARSERS + lookahead)
+const KBLOCK: usize = 16 << 20; // streamed read block
+const KCARRY: usize = 4096; // max partial line carried between blocks
+const KALIGN: usize = 4096; // F_NOCACHE DMA alignment
+const KCARRY_AREA: usize = 8192; // space reserved in front of the read area
 const KSLACK: usize = 4096; // buffer tail slack for 8-byte over-reads
-const KMAX_LINE: usize = 96; // fast path assumption: every line is shorter
 const KMAX_NAME: usize = 32; // slot name capacity
+const KNOCACHE_MIN: usize = 256 << 20; // bypass the cache for big inputs
 
 const KSEMI: u64 = 0x3B3B_3B3B_3B3B_3B3B; // ';' x8
 const KONES: u64 = 0x0101_0101_0101_0101;
@@ -40,6 +57,11 @@ const KHIGH: u64 = 0x8080_8080_8080_8080;
 const KMUL1: u64 = 0x9E37_79B9_7F4A_7C15;
 const KMUL2: u64 = 0xC2B2_AE3D_27D4_EB4F;
 const KU: f64 = 1.110_223_024_625_156_5e-16; // 2^-53
+const F_NOCACHE: i32 = 48; // <sys/fcntl.h>, macOS
+
+extern "C" {
+    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+}
 
 #[inline(always)]
 unsafe fn load64(p: *const u8) -> u64 {
@@ -144,7 +166,10 @@ impl Table {
                     self.used += 1;
                     return;
                 }
-                if s.hash == hash && s.len as usize == len && name_eq(s.name.as_ptr(), name.as_ptr(), len) {
+                if s.hash == hash
+                    && s.len as usize == len
+                    && name_eq(s.name.as_ptr(), name.as_ptr(), len)
+                {
                     s.sum += t10 as i64;
                     s.cnt += 1;
                     if t10 < s.mn {
@@ -302,14 +327,14 @@ unsafe fn parse_one<S: Sink>(p: *const u8, n: usize, sink: &mut S) {
         q += 1;
     }
     let mut ip: i64 = 0;
-    while q < line_end && p.add(q).read() >= b'0' && p.add(q).read() <= b'9' {
+    while q < line_end && *p.add(q) >= b'0' && *p.add(q) <= b'9' {
         ip = ip * 10 + (*p.add(q) - b'0') as i64;
         q += 1;
     }
     let mut fp: i64 = 0;
     if q < line_end && *p.add(q) == b'.' {
         q += 1;
-        if q < line_end && p.add(q).read() >= b'0' && p.add(q).read() <= b'9' {
+        if q < line_end && *p.add(q) >= b'0' && *p.add(q) <= b'9' {
             fp = (*p.add(q) - b'0') as i64;
         }
     }
@@ -429,36 +454,224 @@ fn pread_full(file: &File, buf: &mut [u8], off: u64) -> usize {
     total
 }
 
-// Streams [start, end) in KBLOCK chunks, feeding every complete line to sink.
-// `end` is a line boundary or the end of file.
-fn stream_range<S: Sink>(file: &File, start: usize, end: usize, sink: &mut S) {
-    let mut buf = vec![0u8; KBLOCK + KSLACK];
-    let mut pos = start;
-    let mut carry = 0usize;
-    while pos < end {
-        if carry + KBLOCK + KSLACK > buf.len() {
-            buf.resize((carry + KBLOCK + KSLACK) * 2, 0);
+// Page-aligned buffer handed from the reader to the parsers.
+struct Block {
+    raw: *mut u8,
+    cap: usize,
+    data: *const u8, // parser input (carry area + fresh bytes)
+    len: usize,
+    last: bool,
+}
+
+unsafe impl Send for Block {}
+
+impl Block {
+    fn new() -> Block {
+        let mut b = Block {
+            raw: std::ptr::null_mut(),
+            cap: 0,
+            data: std::ptr::null(),
+            len: 0,
+            last: false,
+        };
+        b.reserve(KCARRY_AREA + KBLOCK + KSLACK);
+        b
+    }
+    fn layout(cap: usize) -> Layout {
+        Layout::from_size_align(cap, KALIGN).unwrap()
+    }
+    fn reserve(&mut self, need: usize) {
+        if self.cap >= need {
+            return;
         }
-        let want = std::cmp::min(KBLOCK, end - pos);
-        let got = pread_full(file, &mut buf[carry..carry + want], pos as u64);
-        if got == 0 {
-            break;
-        }
-        pos += got;
-        let n = carry + got;
-        let safe = if n > KMAX_LINE { n - KMAX_LINE } else { 0 };
-        let consumed = unsafe { parse_lines(buf.as_ptr(), safe, sink) };
-        carry = n - consumed;
-        if carry > 0 {
-            buf.copy_within(consumed..consumed + carry, 0);
+        let rounded = (need + KALIGN - 1) & !(KALIGN - 1);
+        unsafe {
+            let p = alloc(Block::layout(rounded));
+            if p.is_null() {
+                eprintln!("out of memory");
+                std::process::exit(1);
+            }
+            if !self.raw.is_null() {
+                dealloc(self.raw, Block::layout(self.cap));
+            }
+            self.raw = p;
+            self.cap = rounded;
         }
     }
-    if carry > 0 {
-        // All remaining bytes are complete lines except possibly the last one.
-        let consumed = unsafe { parse_lines(buf.as_ptr(), carry, sink) };
-        if consumed < carry {
-            unsafe { parse_one(buf.as_ptr().add(consumed), carry - consumed, sink) };
+}
+
+impl Drop for Block {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { dealloc(self.raw, Block::layout(self.cap)) };
         }
+    }
+}
+
+// Bounded hand-off queue with a buffer pool.
+struct QueueState {
+    free: Vec<Block>,
+    ready: Vec<Block>,
+    done: bool,
+}
+
+struct BlockQueue {
+    state: Mutex<QueueState>,
+    cv_free: Condvar,
+    cv_ready: Condvar,
+}
+
+impl BlockQueue {
+    fn new() -> BlockQueue {
+        let mut free = Vec::with_capacity(KSLOTS);
+        for _ in 0..KSLOTS {
+            free.push(Block::new());
+        }
+        BlockQueue {
+            state: Mutex::new(QueueState {
+                free,
+                ready: Vec::new(),
+                done: false,
+            }),
+            cv_free: Condvar::new(),
+            cv_ready: Condvar::new(),
+        }
+    }
+    fn acquire(&self) -> Block {
+        let mut st = self.state.lock().unwrap();
+        loop {
+            if let Some(b) = st.free.pop() {
+                return b;
+            }
+            st = self.cv_free.wait(st).unwrap();
+        }
+    }
+    fn publish(&self, b: Block) {
+        let mut st = self.state.lock().unwrap();
+        st.ready.push(b);
+        drop(st);
+        self.cv_ready.notify_one();
+    }
+    fn take(&self) -> Option<Block> {
+        let mut st = self.state.lock().unwrap();
+        loop {
+            if let Some(b) = st.ready.pop() {
+                return Some(b);
+            }
+            if st.done {
+                return None;
+            }
+            st = self.cv_ready.wait(st).unwrap();
+        }
+    }
+    fn release(&self, b: Block) {
+        let mut st = self.state.lock().unwrap();
+        st.free.push(b);
+        drop(st);
+        self.cv_free.notify_one();
+    }
+    fn finish(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.done = true;
+        drop(st);
+        self.cv_ready.notify_all();
+    }
+}
+
+// Index just past the last '\n' in [buf, buf+n), or 0 if there is none within
+// the last KCARRY bytes (then the reader accumulates that line separately).
+unsafe fn last_line_end(buf: *const u8, n: usize) -> usize {
+    let lo = if n > KCARRY { n - KCARRY } else { 0 };
+    let mut i = n;
+    while i > lo {
+        if *buf.add(i - 1) == b'\n' {
+            return i;
+        }
+        i -= 1;
+    }
+    0
+}
+
+// The single sequential reader: F_NOCACHE, large page-aligned blocks.
+fn reader(file: &File, fsize: usize, q: &BlockQueue, giant: &mut WorkerSink) {
+    let mut longline: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+    let mut carry = 0usize;
+    let mut cur = q.acquire();
+    loop {
+        let want = std::cmp::min(KBLOCK, fsize - pos);
+        let rdst = unsafe { cur.raw.add(KCARRY_AREA) };
+        let got = {
+            let buf = unsafe { std::slice::from_raw_parts_mut(rdst, want) };
+            pread_full(file, buf, pos as u64)
+        };
+        pos += got;
+        let at_end = got == 0 || pos >= fsize;
+
+        if !longline.is_empty() {
+            // A line longer than KCARRY is being accumulated.
+            longline.extend_from_slice(unsafe { std::slice::from_raw_parts(rdst, got) });
+            let extra = 64;
+            longline.resize(longline.len() + extra, 0);
+            let stop = unsafe { parse_lines(longline.as_ptr(), longline.len() - extra, giant) };
+            longline.truncate(longline.len() - extra);
+            if stop > 0 {
+                longline.drain(..stop);
+            }
+            if at_end {
+                if !longline.is_empty() {
+                    unsafe { parse_one(longline.as_ptr(), longline.len(), giant) };
+                }
+                break;
+            }
+            continue;
+        }
+
+        let data = unsafe { rdst.sub(carry) };
+        let n = carry + got;
+        let cut = if at_end {
+            n
+        } else {
+            unsafe { last_line_end(data, n) }
+        };
+        if !at_end && cut == 0 {
+            longline.extend_from_slice(unsafe { std::slice::from_raw_parts(data, n) });
+            carry = 0;
+            continue;
+        }
+        cur.data = data;
+        cur.len = cut;
+        cur.last = at_end;
+        q.publish(cur);
+        if at_end {
+            break;
+        }
+        carry = n - cut;
+        cur = q.acquire();
+        if carry > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.add(cut),
+                    cur.raw.add(KCARRY_AREA - carry),
+                    carry,
+                )
+            };
+        }
+    }
+}
+
+fn parser(q: &BlockQueue, table: &mut Table, longs: &mut LongNameTable) {
+    let mut sink = WorkerSink { table, longs };
+    while let Some(b) = q.take() {
+        if b.len > 0 {
+            let consumed = unsafe { parse_lines(b.data, b.len, &mut sink) };
+            if consumed < b.len {
+                let rest = b.data as usize + consumed;
+                let total = b.data as usize + b.len;
+                unsafe { parse_one(rest as *const u8, total - rest, &mut sink) };
+            }
+        }
+        q.release(b);
     }
 }
 
@@ -516,6 +729,38 @@ impl Sink for RiskySink<'_> {
     }
 }
 
+// Streams [start, end) in KBLOCK chunks, feeding every complete line to sink.
+// Used off the hot path (ambiguous-mean rescan).
+fn stream_range<S: Sink>(file: &File, start: usize, end: usize, sink: &mut S) {
+    let mut buf = vec![0u8; KBLOCK + KSLACK];
+    let mut pos = start;
+    let mut carry = 0usize;
+    while pos < end {
+        if carry + KBLOCK + KSLACK > buf.len() {
+            buf.resize((carry + KBLOCK + KSLACK) * 2, 0);
+        }
+        let want = std::cmp::min(KBLOCK, end - pos);
+        let got = pread_full(file, &mut buf[carry..carry + want], pos as u64);
+        if got == 0 {
+            break;
+        }
+        pos += got;
+        let n = carry + got;
+        let safe = if n > 96 { n - 96 } else { 0 };
+        let consumed = unsafe { parse_lines(buf.as_ptr(), safe, sink) };
+        carry = n - consumed;
+        if carry > 0 {
+            buf.copy_within(consumed..consumed + carry, 0);
+        }
+    }
+    if carry > 0 {
+        let consumed = unsafe { parse_lines(buf.as_ptr(), carry, sink) };
+        if consumed < carry {
+            unsafe { parse_one(buf.as_ptr().add(consumed), carry - consumed, sink) };
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
@@ -536,61 +781,36 @@ fn main() {
             std::process::exit(1);
         }
     };
-    if fsize == 0 {
-        print!("{{}}\n");
-        return;
+    if fsize >= KNOCACHE_MIN {
+        // Read once, sequentially: keep the data out of the buffer cache.
+        unsafe {
+            fcntl(file.as_raw_fd(), F_NOCACHE, 1);
+        }
     }
 
-    // Split the file into newline-aligned slices.
-    let nthreads = if fsize < KBLOCK { 1 } else { KTHREADS };
-    let mut bounds = vec![0usize; nthreads + 1];
-    bounds[nthreads] = fsize;
-    for i in 1..nthreads {
-        let b = fsize / nthreads * i;
-        let mut probe = b;
-        let mut nlpos = fsize;
-        let mut tmp = [0u8; 256];
-        while probe < fsize {
-            let got = pread_full(&file, &mut tmp, probe as u64);
-            if got == 0 {
-                break;
-            }
-            match unsafe { find_byte(tmp.as_ptr(), got, b'\n') } {
-                Some(k) => {
-                    nlpos = probe + k + 1;
-                    break;
-                }
-                None => probe += got,
-            }
-        }
-        bounds[i] = nlpos;
-    }
-    for i in 1..nthreads {
-        if bounds[i] < bounds[i - 1] {
-            bounds[i] = bounds[i - 1];
-        }
-    }
+    let queue = BlockQueue::new();
+    let mut giant_table = Table::new();
+    let mut giant_longs = LongNameTable::default();
 
     let results: Vec<(Table, LongNameTable)> = thread::scope(|s| {
-        let mut handles = Vec::with_capacity(nthreads);
-        for i in 0..nthreads {
-            let (start, end) = (bounds[i], bounds[i + 1]);
-            let f = &file;
+        let mut handles = Vec::with_capacity(KPARSERS);
+        for _ in 0..KPARSERS {
+            let q = &queue;
             handles.push(s.spawn(move || {
                 let mut table = Table::new();
                 let mut longs = LongNameTable::default();
-                if start < end {
-                    {
-                        let mut sink = WorkerSink {
-                            table: &mut table,
-                            longs: &mut longs,
-                        };
-                        stream_range(f, start, end, &mut sink);
-                    }
-                }
+                parser(q, &mut table, &mut longs);
                 (table, longs)
             }));
         }
+        {
+            let mut giant = WorkerSink {
+                table: &mut giant_table,
+                longs: &mut giant_longs,
+            };
+            reader(&file, fsize, &queue, &mut giant);
+        }
+        queue.finish();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
@@ -614,6 +834,23 @@ fn main() {
         for r in longs.map.values() {
             recs.push(r.clone());
         }
+    }
+    for s in giant_table.slots.iter() {
+        if s.cnt == 0 {
+            continue;
+        }
+        recs.push(Rec {
+            long_name: Vec::new(),
+            name: s.name,
+            len: s.len as usize,
+            sum: s.sum,
+            mn: s.mn,
+            mx: s.mx,
+            cnt: s.cnt,
+        });
+    }
+    for r in giant_longs.map.values() {
+        recs.push(r.clone());
     }
 
     recs.sort_by(|a, b| a.key().cmp(b.key()));
@@ -657,8 +894,7 @@ fn main() {
         for (i, e) in merged.iter().enumerate() {
             for it in risky.iter() {
                 if it.name == e.key() {
-                    mean10[i] =
-                        ((it.sum / e.cnt as f64) * 10.0 + 0.5).floor() as i64;
+                    mean10[i] = ((it.sum / e.cnt as f64) * 10.0 + 0.5).floor() as i64;
                     break;
                 }
             }

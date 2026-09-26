@@ -1,0 +1,30 @@
+{
+  "ts": "2026-09-26T17:37:38Z",
+  "track": "cpp",
+  "status": "valid",
+  "reason": null,
+  "input": "data/measurements_1b.txt",
+  "input_bytes": 13795509404,
+  "expected_sha256": "fa0299de6a1fefeb5c50a822a9b694761ee1d0a3d5180b8e5a8bb9554a4be0f6",
+  "runs": 5,
+  "warmup": 1,
+  "times": [
+    5.8746,
+    5.8706,
+    5.9161,
+    5.8743,
+    5.9193
+  ],
+  "median": 5.874564582947642,
+  "min": 5.870620416011661,
+  "max": 5.9193064159480855,
+  "max_rss_bytes": 137248768,
+  "commit": "c700d33",
+  "dirty": true,
+  "fresh": {
+    "rows": 1000000,
+    "seed": 5858710510146929415,
+    "ok": true,
+    "detail": "match"
+  }
+}
