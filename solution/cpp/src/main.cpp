@@ -1,93 +1,583 @@
 /*
- * 1BRC C++ track - naive baseline (correct, intentionally unoptimized).
+ * 1BRC C++ track - parallel, I/O-bound implementation.
  *
- * Interface: 1brc <input_file>   -> result to stdout
+ *  1brc <input_file>   -> result to stdout
  *
- * Improve this file. Keep it a single translation unit with no external
- * dependencies. See AGENTS.md for rules, semantics and the iteration loop.
+ * Design notes
+ * ------------
+ * - The 1B input does not fit in the page cache, so wall clock is dominated by
+ *   reading ~13.8 GB from the SSD.  On this machine read(2) into a large buffer
+ *   sustains ~2.3 GB/s while mmap page-faulting sustains only ~0.6 GB/s, and
+ *   extra concurrent streams do not raise device throughput.  So: a few threads,
+ *   each pread()ing its own contiguous, newline-aligned slice in kBlock chunks
+ *   and parsing in place, overlapping parse work with I/O.
+ * - Parsing uses 8-byte SWAR loads: locate ';', then decode the canonical
+ *   temperature forms [-]D.D / [-]DD.D / [-]DDD.D with a single 8-byte load.
+ *   Anything else falls back to a tolerant scalar parser that mirrors the
+ *   reference implementation.
+ * - Aggregation keeps per-thread open-addressing tables (64-byte slots, one
+ *   cache line each) keyed by a hash of the station name.  min/max/sum are
+ *   accumulated as exact integers of scaled tenths.
+ *
+ * Mean rounding
+ * -------------
+ * The reference accumulates `sum` as a double in file order and computes
+ * mean = floor((sum / count) * 10 + 0.5) / 10.  Parallel accumulation cannot
+ * reproduce that summation order, so this implementation uses the exact
+ * rational value floor((2*S + n) / (2*n)), S = exact sum of tenths, n = count.
+ * The two agree unless the exact value lands inside the reference's rounding
+ * error of a .5 boundary; that window is bounded by
+ *     |dQ| <= 8 * u * (n * max|t10| + 8 * (|S|/n + 1)),   u = 2^-53
+ * (per-add error bound + per-value conversion rounding + final operations).
+ * Every station whose exact value falls inside that window is recomputed with
+ * a sequential double scan in file order, exactly like the reference.  For the
+ * harness inputs the window is ~1e-6 wide, so it triggers with probability
+ * ~1e-3 and never costs measurable time.
  */
+#include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <map>
 #include <string>
+#include <thread>
+#include <unistd.h>
+#include <vector>
 
-struct Agg {
-    double min = 1e308;
-    double max = -1e308;
-    double sum = 0.0;
-    long long count = 0;
+namespace {
+
+// ---------------------------------------------------------------- tuning ----
+constexpr int      kThreads = 4;         // reader+parser threads
+constexpr size_t   kBlock   = 4u << 20;  // read block per thread
+constexpr size_t   kSlack   = 4096;      // buffer tail slack for 8-byte over-reads
+constexpr uint32_t kMaxLine = 96;        // fast path assumption: every line is shorter
+constexpr uint32_t kMaxName = 32;        // slot name capacity
+
+constexpr uint64_t kSemi = 0x3B3B3B3B3B3B3B3BULL;  // ';' x8
+constexpr uint64_t kOnes = 0x0101010101010101ULL;
+constexpr uint64_t kHigh = 0x8080808080808080ULL;
+constexpr uint64_t kMul1 = 0x9E3779B97F4A7C15ULL;
+constexpr uint64_t kMul2 = 0xC2B2AE3D27D4EB4FULL;
+constexpr double   kU    = 1.1102230246251565e-16;  // 2^-53
+
+inline uint64_t load64(const void *p) {
+    uint64_t v;
+    std::memcpy(&v, p, 8);
+    return v;
+}
+inline uint64_t low_mask(uint32_t k) {
+    if (k == 0) return 0;
+    if (k >= 8) return ~0ULL;
+    return ~0ULL >> (64 - 8 * k);
+}
+
+// ------------------------------------------------------------- hash table ----
+struct Slot {
+    uint64_t hash;
+    int64_t  sum;      // exact sum of tenths
+    int32_t  mn, mx;   // min/max in tenths
+    uint32_t cnt;      // 0 == empty
+    uint32_t len;
+    uint8_t  name[kMaxName];
 };
+static_assert(sizeof(Slot) == 64, "slot should be one cache line");
+
+inline uint64_t hash_name(const uint8_t *p, uint32_t len) {
+    uint64_t h;
+    if (len <= 8) {
+        h = (load64(p) & low_mask(len)) * kMul1;
+    } else {
+        h = (load64(p) ^ (load64(p + len - 8) * kMul2) ^ (uint64_t)len) * kMul1;
+    }
+    return h ^ (h >> 32);
+}
+
+inline bool name_eq(const uint8_t *a, const uint8_t *b, uint32_t len) {
+    uint32_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        if (load64(a + i) != load64(b + i)) return false;
+    }
+    if (i < len) {
+        uint64_t m = low_mask(len - i);
+        if (((load64(a + i) ^ load64(b + i)) & m) != 0) return false;
+    }
+    return true;
+}
+
+struct Rec {  // one station aggregate
+    std::string long_name;  // non-empty iff len > kMaxName
+    uint8_t  name[kMaxName];
+    uint32_t len = 0;
+    int64_t  sum = 0;
+    int32_t  mn = INT32_MAX;
+    int32_t  mx = INT32_MIN;
+    uint32_t cnt = 0;
+    const uint8_t *key() const {
+        return long_name.empty() ? name : (const uint8_t *)long_name.data();
+    }
+    void absorb(const Rec &o) {
+        sum += o.sum;
+        cnt += o.cnt;
+        if (o.mn < mn) mn = o.mn;
+        if (o.mx > mx) mx = o.mx;
+    }
+};
+
+// Names longer than kMaxName (impossible for the harness station universe).
+class LongNameTable {
+  public:
+    inline void add(const uint8_t *name, uint32_t len, uint64_t, int32_t t10) {
+        Rec &r = map_[std::string((const char *)name, len)];
+        if (r.cnt == 0) {
+            r.long_name.assign((const char *)name, len);
+            r.len = len;
+            r.mn = r.mx = t10;
+        }
+        r.sum += t10;
+        r.cnt++;
+        if (t10 < r.mn) r.mn = t10;
+        if (t10 > r.mx) r.mx = t10;
+    }
+    const std::map<std::string, Rec> &map() const { return map_; }
+
+  private:
+    std::map<std::string, Rec> map_;
+};
+
+// Per-thread aggregation table keyed by station name.
+class Table {
+  public:
+    void init() {
+        slots_.assign(kInitial, Slot{});
+        mask_ = kInitial - 1;
+        used_ = 0;
+    }
+    const std::vector<Slot> &slots() const { return slots_; }
+
+    inline void add(const uint8_t *name, uint32_t len, uint64_t h, int32_t t10) {
+        if (used_ * 2 >= slots_.size()) grow();
+        uint32_t i = (uint32_t)h & mask_;
+        for (;;) {
+            Slot &s = slots_[i];
+            if (s.cnt == 0) {
+                s.hash = h;
+                s.len = len;
+                std::memcpy(s.name, name, len);
+                s.sum = t10;
+                s.mn = t10;
+                s.mx = t10;
+                s.cnt = 1;
+                used_++;
+                return;
+            }
+            if (s.hash == h && s.len == len && name_eq(s.name, name, len)) {
+                s.sum += t10;
+                s.cnt++;
+                if (t10 < s.mn) s.mn = t10;
+                if (t10 > s.mx) s.mx = t10;
+                return;
+            }
+            i = (i + 1) & mask_;
+        }
+    }
+
+    // Doubles the table, keeping the load factor below 50%.
+    void grow() {
+        std::vector<Slot> old;
+        old.swap(slots_);
+        slots_.assign(old.size() * 2, Slot{});
+        mask_ = (uint32_t)slots_.size() - 1;
+        used_ = 0;
+        for (const Slot &s : old) {
+            if (!s.cnt) continue;
+            uint32_t i = (uint32_t)s.hash & mask_;
+            while (slots_[i].cnt) i = (i + 1) & mask_;
+            slots_[i] = s;
+            used_++;
+        }
+    }
+
+  private:
+    static constexpr uint32_t kInitial = 1024;
+    std::vector<Slot> slots_;
+    uint32_t mask_ = 0;
+    uint32_t used_ = 0;
+};
+
+// ------------------------------------------------------------ line parser ----
+// Reference-compatible parse of one line whose content is [name, line_end)
+// (trailing \r and \n already stripped by the caller).
+template <typename Sink>
+void parse_one(const uint8_t *name, const uint8_t *line_end, Sink &sink) {
+    const uint8_t *semi = (const uint8_t *)std::memchr(name, ';', (size_t)(line_end - name));
+    if (!semi) return;
+    const uint8_t *q = semi + 1;
+    bool neg = false;
+    if (q < line_end && *q == '-') {
+        neg = true;
+        q++;
+    }
+    int64_t ip = 0;
+    while (q < line_end && *q >= '0' && *q <= '9') ip = ip * 10 + (*q++ - '0');
+    int64_t fp = 0;
+    if (q < line_end && *q == '.') {
+        q++;
+        if (q < line_end && *q >= '0' && *q <= '9') fp = *q++ - '0';
+    }
+    int64_t t10 = ip * 10 + fp;
+    if (neg) t10 = -t10;
+    if (t10 >= INT32_MIN && t10 <= INT32_MAX) {
+        uint32_t len = (uint32_t)(semi - name);
+        sink.add(name, len, hash_name(name, len), (int32_t)t10);
+    }
+}
+
+inline const uint8_t *strip_eol(const uint8_t *p, const uint8_t *line_end) {
+    while (line_end > p && (line_end[-1] == '\r' || line_end[-1] == '\n')) line_end--;
+    return line_end;
+}
+
+// Tolerant parser for one complete line starting at p, the '\n' being inside
+// [p, end).  Returns the position just past that '\n', or `p` when the buffer
+// ends inside the line (the caller must supply more data).
+template <typename Sink>
+const uint8_t *slow_line(const uint8_t *p, const uint8_t *end, Sink &sink) {
+    const uint8_t *nl = (const uint8_t *)std::memchr(p, '\n', (size_t)(end - p));
+    if (!nl) return p;
+    parse_one(p, strip_eol(p, nl), sink);
+    return nl + 1;
+}
+
+// Parses complete lines in [buf, buf+n).  The caller guarantees that n counts
+// whole lines only and that at least 24 bytes are readable past buf+n.
+// Returns the end of the last complete line.
+template <typename Sink>
+const uint8_t *parse_lines(const uint8_t *buf, size_t n, Sink &sink) {
+    const uint8_t *p = buf;
+    const uint8_t *end = buf + n;
+    while (p < end) {
+        // Locate ';' within the first 32 bytes of the line.
+        uint64_t m = 0;
+        const uint8_t *q = p;
+        for (int i = 0; i < 4; i++) {
+            uint64_t x = load64(q) ^ kSemi;
+            m = (x - kOnes) & ~x & kHigh;
+            if (m) break;
+            q += 8;
+        }
+        uint32_t adv = 0;
+        int32_t t10 = 0;
+        bool ok = false;
+        uint32_t len = 0;
+        const uint8_t *t = p;
+        if (m) {
+            len = (uint32_t)(q - p) + (uint32_t)(__builtin_ctzll(m) >> 3);
+            t = p + len + 1;
+            uint64_t w = load64(t);
+            uint32_t neg = (uint32_t)((w & 0xFF) == '-');
+            uint64_t v = neg ? (w >> 8) : w;
+            uint32_t b0 = (uint32_t)(v & 0xFF);
+            uint32_t b1 = (uint32_t)((v >> 8) & 0xFF);
+            uint32_t b2 = (uint32_t)((v >> 16) & 0xFF);
+            if (b2 == '.' && b0 - '0' <= 9 && b1 - '0' <= 9) {
+                uint32_t b3 = (uint32_t)((v >> 24) & 0xFF);  // fraction digit
+                if (b3 - '0' <= 9) {
+                    t10 = (int32_t)(((b0 - '0') * 10 + (b1 - '0')) * 10 + (b3 - '0'));
+                    adv = 5 + neg;
+                    ok = true;
+                }
+            } else if (b1 == '.' && b0 - '0' <= 9) {
+                uint32_t d = b2 - '0';
+                if (d <= 9) {
+                    t10 = (int32_t)((b0 - '0') * 10 + d);
+                    adv = 4 + neg;
+                    ok = true;
+                }
+            } else {
+                uint32_t d0 = b0 - '0', d1 = b1 - '0', d2 = b2 - '0';
+                uint32_t b3 = (uint32_t)((v >> 24) & 0xFF);
+                uint32_t b4 = (uint32_t)((v >> 32) & 0xFF);
+                if (b3 == '.' && d0 <= 9 && d1 <= 9 && d2 <= 9 && b4 - '0' <= 9) {
+                    t10 = (int32_t)(((d0 * 10 + d1) * 10 + d2) * 10 + (b4 - '0'));
+                    adv = 6 + neg;
+                    ok = true;
+                }
+            }
+            if (ok && t[adv - 1] != '\n') ok = false;
+            if (ok && neg) t10 = -t10;
+        }
+        if (ok) {
+            sink.add(p, len, hash_name(p, len), t10);
+            p = t + adv;
+            continue;
+        }
+        const uint8_t *nx = slow_line(p, end, sink);
+        if (nx == p) return p;
+        p = nx;
+    }
+    return p;
+}
+
+// --------------------------------------------------------------- I/O layer ----
+bool pread_full(int fd, void *buf, size_t n, size_t off, size_t *got) {
+    uint8_t *p = (uint8_t *)buf;
+    size_t total = 0;
+    while (total < n) {
+        ssize_t r = pread(fd, p + total, n - total, (off_t)(off + total));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            *got = total;
+            return false;
+        }
+        if (r == 0) break;
+        total += (size_t)r;
+    }
+    *got = total;
+    return true;
+}
+
+// Streams [start, end) in kBlock chunks, feeding every complete line to sink.
+// `end` is a line boundary or the end of file.
+template <typename Sink>
+void stream_range(int fd, size_t start, size_t end, Sink &sink) {
+    std::vector<uint8_t> buf(kBlock + kSlack);
+    size_t pos = start;
+    size_t carry = 0;
+    while (pos < end) {
+        if (carry + kBlock + kSlack > buf.size()) buf.resize((carry + kBlock + kSlack) * 2);
+        size_t want = end - pos;
+        if (want > kBlock) want = kBlock;
+        size_t got = 0;
+        pread_full(fd, buf.data() + carry, want, pos, &got);
+        if (got == 0) break;
+        pos += got;
+        size_t n = carry + got;
+        size_t safe = n > kMaxLine ? n - kMaxLine : 0;
+        const uint8_t *p = parse_lines(buf.data(), safe, sink);
+        carry = n - (size_t)(p - buf.data());
+        if (carry) std::memmove(buf.data(), p, carry);
+    }
+    if (carry) {
+        // All remaining bytes are complete lines except possibly the last one.
+        const uint8_t *p = parse_lines(buf.data(), carry, sink);
+        if (p < buf.data() + carry) {
+            // Final line without a trailing newline (tolerated by the reference).
+            parse_one(p, strip_eol(p, buf.data() + carry), sink);
+        }
+    }
+}
+
+// -------------------------------------------------------------- formatting ----
+void append_i10(std::string &out, int64_t v10) {
+    if (v10 < 0) {
+        out.push_back('-');
+        v10 = -v10;
+    }
+    uint64_t a = (uint64_t)v10;
+    uint64_t ip = a / 10;
+    uint32_t fp = (uint32_t)(a % 10);
+    char tmp[24];
+    int n = 0;
+    if (ip == 0) tmp[n++] = '0';
+    while (ip) {
+        tmp[n++] = (char)('0' + (int)(ip % 10));
+        ip /= 10;
+    }
+    while (n) out.push_back(tmp[--n]);
+    out.push_back('.');
+    out.push_back((char)('0' + (int)fp));
+}
+
+// Sequential scan accumulating a reference-identical double sum for stations
+// whose exact mean is ambiguous.
+struct RiskySink {
+    struct Item {
+        const uint8_t *name;
+        uint32_t len;
+        double sum;
+        uint64_t count;
+    };
+    std::vector<Item> *items;
+    inline void add(const uint8_t *name, uint32_t len, uint64_t, int32_t t10) {
+        for (Item &it : *items) {
+            if (it.len == len && std::memcmp(it.name, name, len) == 0) {
+                it.sum += (double)t10 / 10.0;
+                it.count++;
+                return;
+            }
+        }
+    }
+};
+
+}  // namespace
 
 int main(int argc, char **argv) {
     if (argc != 2) {
-        fprintf(stderr, "usage: %s <input_file>\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <input_file>\n", argv[0]);
         return 1;
     }
-    FILE *f = fopen(argv[1], "rb");
-    if (!f) {
-        perror(argv[1]);
+    int fd = open(argv[1], O_RDONLY);
+    if (fd < 0) {
+        std::perror(argv[1]);
         return 1;
     }
+    off_t fsize_off = lseek(fd, 0, SEEK_END);
+    if (fsize_off < 0) {
+        std::perror("lseek");
+        return 1;
+    }
+    size_t fsize = (size_t)fsize_off;
+#ifdef POSIX_FADV_SEQUENTIAL
+    posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
 
-    std::map<std::string, Agg> stats;
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        char *semi = strchr(line, ';');
-        if (!semi) {
-            continue;
+    // Split the file into newline-aligned slices.
+    int nthreads = kThreads;
+    if (fsize < kBlock) nthreads = 1;
+    std::vector<size_t> bounds((size_t)nthreads + 1);
+    bounds[0] = 0;
+    bounds[(size_t)nthreads] = fsize;
+    for (int i = 1; i < nthreads; i++) {
+        size_t b = fsize / (size_t)nthreads * (size_t)i;
+        uint8_t tmp[256];
+        size_t probe = b;
+        size_t nlpos = fsize;
+        while (probe < fsize) {
+            size_t got = 0;
+            if (!pread_full(fd, tmp, sizeof(tmp), probe, &got) || got == 0) break;
+            const uint8_t *nl = (const uint8_t *)std::memchr(tmp, '\n', got);
+            if (nl) {
+                nlpos = probe + (size_t)(nl - tmp) + 1;
+                break;
+            }
+            probe += got;
         }
-        *semi = '\0';
-        const char *p = semi + 1;
+        bounds[(size_t)i] = nlpos;
+    }
+    for (int i = 1; i < nthreads; i++) {
+        if (bounds[(size_t)i] < bounds[(size_t)i - 1]) bounds[(size_t)i] = bounds[(size_t)i - 1];
+    }
 
-        bool neg = false;
-        if (*p == '-') {
-            neg = true;
-            p++;
+    std::vector<Table> tables((size_t)nthreads);
+    std::vector<LongNameTable> longs((size_t)nthreads);
+    std::vector<std::thread> threads;
+    threads.reserve((size_t)nthreads);
+    for (int i = 0; i < nthreads; i++) {
+        threads.emplace_back([&, i]() {
+            Table &tab = tables[(size_t)i];
+            tab.init();
+            size_t start = bounds[(size_t)i];
+            size_t end = bounds[(size_t)i + 1];
+            if (start >= end) return;
+            struct Sink {
+                Table *tab;
+                LongNameTable *longs;
+                inline void add(const uint8_t *name, uint32_t len, uint64_t h, int32_t t10) {
+                    if (len <= kMaxName) {
+                        tab->add(name, len, h, t10);
+                    } else {
+                        longs->add(name, len, h, t10);
+                    }
+                }
+            } sink{&tab, &longs[(size_t)i]};
+            stream_range(fd, start, end, sink);
+        });
+    }
+    for (std::thread &t : threads) t.join();
+
+    // Merge per-thread tables.
+    std::vector<Rec> recs;
+    recs.reserve(1024);
+    for (int i = 0; i < nthreads; i++) {
+        for (const Slot &s : tables[(size_t)i].slots()) {
+            if (!s.cnt) continue;
+            Rec r;
+            std::memcpy(r.name, s.name, kMaxName);
+            r.len = s.len;
+            r.sum = s.sum;
+            r.mn = s.mn;
+            r.mx = s.mx;
+            r.cnt = s.cnt;
+            recs.push_back(std::move(r));
         }
-        long long ip = 0;
-        while (*p >= '0' && *p <= '9') {
-            ip = ip * 10 + (*p++ - '0');
+        for (const auto &kv : longs[(size_t)i].map()) recs.push_back(kv.second);
+    }
+
+    std::sort(recs.begin(), recs.end(), [](const Rec &a, const Rec &b) {
+        uint32_t m = a.len < b.len ? a.len : b.len;
+        int c = std::memcmp(a.key(), b.key(), m);
+        if (c != 0) return c < 0;
+        return a.len < b.len;
+    });
+    std::vector<Rec> merged;
+    merged.reserve(recs.size());
+    for (const Rec &r : recs) {
+        if (!merged.empty() && merged.back().len == r.len &&
+            std::memcmp(merged.back().key(), r.key(), r.len) == 0) {
+            merged.back().absorb(r);
+        } else {
+            merged.push_back(r);
         }
-        long long fp = 0;
-        if (*p == '.') {
-            p++;
-            if (*p >= '0' && *p <= '9') {
-                fp = *p++ - '0';
+    }
+
+    // Mean of every station, plus the ambiguous ones.
+    std::vector<int64_t> mean10(merged.size());
+    std::vector<RiskySink::Item> risky;
+    for (size_t i = 0; i < merged.size(); i++) {
+        const Rec &e = merged[i];
+        int64_t n = (int64_t)e.cnt;
+        int64_t two_n = 2 * n;
+        int64_t num = 2 * e.sum + n;
+        int64_t q = num / two_n;
+        if (num % two_n != 0 && num < 0) q--;
+        mean10[i] = q;
+        int64_t r = (num % two_n + two_n) % two_n;
+        int64_t dist = std::min(r, two_n - r);
+        double maxabs =
+            (double)std::max(std::abs((int64_t)e.mn), std::abs((int64_t)e.mx));
+        double margin =
+            8.0 * kU * ((double)n * maxabs + 8.0 * (std::abs((double)e.sum) / (double)n + 1.0));
+        if ((double)dist <= margin * (double)two_n) {
+            risky.push_back(RiskySink::Item{e.key(), e.len, 0.0, 0});
+        }
+    }
+    if (!risky.empty()) {
+        RiskySink sink{&risky};
+        stream_range(fd, 0, fsize, sink);
+        for (size_t i = 0; i < merged.size(); i++) {
+            for (const RiskySink::Item &it : risky) {
+                if (it.len == merged[i].len &&
+                    std::memcmp(it.name, merged[i].key(), it.len) == 0) {
+                    mean10[i] = (int64_t)std::floor(
+                        (it.sum / (double)merged[i].cnt) * 10.0 + 0.5);
+                    break;
+                }
             }
         }
-        long long t10 = ip * 10 + fp;
-        if (neg) {
-            t10 = -t10;
-        }
-        double v = (double)t10 / 10.0;
-
-        Agg &a = stats[std::string(line)];
-        if (v < a.min) {
-            a.min = v;
-        }
-        if (v > a.max) {
-            a.max = v;
-        }
-        a.sum += v;
-        a.count++;
     }
-    fclose(f);
 
-    std::string out = "{";
-    bool first = true;
-    for (const auto &[name, a] : stats) {
-        if (!first) {
-            out += ", ";
-        }
-        first = false;
-        double mean = std::floor((a.sum / (double)a.count) * 10.0 + 0.5) / 10.0;
-        char buf[128];
-        snprintf(buf, sizeof(buf), "%s=%.1f/%.1f/%.1f", name.c_str(), a.min, mean, a.max);
-        out += buf;
+    std::string out;
+    out.reserve(1 << 14);
+    out.push_back('{');
+    for (size_t i = 0; i < merged.size(); i++) {
+        if (i) out.append(", ");
+        out.append((const char *)merged[i].key(), merged[i].len);
+        out.push_back('=');
+        append_i10(out, merged[i].mn);
+        out.push_back('/');
+        append_i10(out, mean10[i]);
+        out.push_back('/');
+        append_i10(out, merged[i].mx);
     }
-    out += "}\n";
-    fwrite(out.data(), 1, out.size(), stdout);
+    out.append("}\n");
+    if (std::fwrite(out.data(), 1, out.size(), stdout) != out.size()) {
+        std::perror("fwrite");
+        return 1;
+    }
+    close(fd);
     return 0;
 }
